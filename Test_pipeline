@@ -1,0 +1,56 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import sum, col
+from azure.storage.blob import BlobServiceClient
+import pandas as pd
+import io
+
+# Initialize Spark Session
+spark = SparkSession.builder.appName("GSynergy_ELT_Pipeline").getOrCreate()
+
+# Azure Storage Account Details
+AZURE_STORAGE_CONNECTION_STRING = "your_connection_string"
+CONTAINER_NAME = "your_container_name"
+
+# Function to extract data from Azure Blob Storage
+def extract_blob_data(blob_name):
+    blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+    blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=blob_name)
+    
+    stream = io.BytesIO(blob_client.download_blob().readall())
+    df = pd.read_csv(stream, delimiter='|')  # Assuming pipe-delimited files
+    return spark.createDataFrame(df)
+
+# Extract raw data
+hier_df = extract_blob_data("hier_category.gz")  # Example hierarchy file
+fact_df = extract_blob_data("fact_sales.gz")  # Example fact file
+
+# Transform: Data Cleaning, Primary Key and Foreign Key Checks
+def clean_data(df, primary_key):
+    df = df.dropna()
+    if df.count() != df.dropDuplicates([primary_key]).count():
+        raise ValueError("Primary Key Violation: Duplicate records found")
+    return df
+
+hier_df = clean_data(hier_df, 'category_id')  # Example primary key
+fact_df = clean_data(fact_df, 'sales_id')
+
+# Transform: Normalize hierarchy tables and create staging schema
+staging_hier_df = hier_df.select("category_id", "category_name")
+staging_fact_df = fact_df.select("sales_id", "pos_site_id", "sku_id", "fsclwk_id", "price_substate_id", "type", "sales_units", "sales_dollars", "discount_dollars")
+
+# Load transformed data into Data Warehouse (Delta Lake assumed)
+DW_PATH = "dbfs:/mnt/delta/warehouse"
+staging_hier_df.write.format("delta").mode("overwrite").save(f"{DW_PATH}/dim_category")
+staging_fact_df.write.format("delta").mode("overwrite").save(f"{DW_PATH}/fact_sales")
+
+# Transform: Creating Materialized View Equivalent (Aggregation)
+mview_weekly_sales = staging_fact_df.groupBy("pos_site_id", "sku_id", "fsclwk_id", "price_substate_id", "type").agg(
+    sum("sales_units").alias("total_units"),
+    sum("sales_dollars").alias("total_sales"),
+    sum("discount_dollars").alias("total_discount")
+)
+
+# Load materialized view into Data Warehouse
+mview_weekly_sales.write.format("delta").mode("overwrite").save(f"{DW_PATH}/mview_weekly_sales")
+
+print("ELT Pipeline Completed Successfully!")
